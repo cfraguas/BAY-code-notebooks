@@ -1,0 +1,572 @@
+---
+title: "SCOP_2023_0255: WT and a1a2KO of AMPK in mouse hepatocytes"
+subtitle: "Correcting for cage, extraction pool, RIN and pooled samples"
+author:
+- "Analysis by Christian Grønbæk & Lars Roed Ingerslev"
+- "christian.gronbaek@sund.ku.dk & ingerslev@sund.ku.dk"
+date: "`r format(Sys.time(), '%d %B, %Y')`"
+knit: (function(inputFile, encoding) { rmarkdown::render(inputFile, encoding = encoding, output_file = paste0('analysis_',format(Sys.time(), "%Y-%m-%d-%H-%M"),'.html')) })
+output:
+   html_document:
+    toc: true
+    toc_float: true
+    toc_depth: 3
+    code_folding: hide
+    df_print: kable
+params:
+  scop_id: SCOP_2023_0255
+editor_options:
+  chunk_output_type: inline
+---
+
+# Pre-processing code blocks {.tabset}
+
+All code used for the analyses can be found throughout this report by expanding the code-blocks in the .html-file on the right-hand side within the appropriate tabs, or through the associated .Rmd file, where it can also be run. You will have to install all the necessary packages yourself though, which can be non-trivial.
+
+## Setup & project specific data loading and formattings
+
+```{r setup, warning=FALSE, message=FALSE, results="hide"}
+knitr::opts_chunk$set(echo = TRUE)
+suppressPackageStartupMessages({
+  library("cbmr")
+  library("org.Mm.eg.db")
+  library("tidyverse") # general data manipulation
+  library("plotly")
+  library("here")
+  library("edgeR")
+  library("data.table")
+})
+org_db <- org.Mm.eg.db
+
+theme_set(theme_bw())
+complex_setup <- TRUE
+results_dir <- here("results")
+dir.create(results_dir, showWarnings = F)
+
+# Prepare metadata, automatically drops empty columns
+meta_data_sheet <- cbmr::prepare_metadata(
+  here("data-raw/metadata_X1_SCOP_2023_0255.xlsx"),
+  new_col_names = c("Cell isolation pool (A,B,C,D)" = "cell_isolation",
+                    "Subject_Name_User_selected_ID" = "sample_id",
+                    "Tube ID" = "tube_id",
+                    "Condition1" = "genotype",
+                    "Condition2" = "treatment",
+                    "Mouse number" = "mouse_number",
+                    "Mouse age" = "age"
+  ),
+  uninteresting_cols = c("Subject_Name_User_selected_ID2",
+                         "species",
+                         "cell_type",
+                         "library_pool",
+                         "sequencing_lane",
+                         "sex")
+)
+meta_data_sheet[, sample_id := str_remove(sample_id, "^SCOP_2023_")]
+meta_data_sheet[, rin := as.numeric(rin)]
+meta_data_sheet[, genotype := fifelse(genotype == "Wild Type", "WT", "KO")]
+meta_data_sheet[, treatment := str_replace(treatment, " \\+ ", "_")]
+meta_data_sheet[, treatment := str_remove(treatment, "\\-")]
+meta_data_sheet[, cage_number := as.character(cage_number)]
+meta_data_sheet[, group := paste0(genotype, "_", treatment)]
+meta_data_sheet[, pooled_status := ifelse(mouse_number %like% " \\+ ",
+                                          "pooled", "singlet")]
+
+
+g_counts_raw <- readRDS(here("data-raw/star_salmon/salmon.merged.gene_counts.rds"))
+counts <- SummarizedExperiment::assays(g_counts_raw)[["counts"]]
+colnames(counts) <- str_remove_all(colnames(counts),
+                                         "^SCOP_2023_|_S[[:digit:]]+$")
+stopifnot(all(colnames(counts) %in% meta_data_sheet$sample_id))
+
+gene_info <- AnnotationDbi::select(x = org_db,
+                                        keys = rownames(counts),
+                                        keytype = "ENSEMBL",
+                                        columns = c("SYMBOL", "GENENAME"))
+
+
+formula_full_model <- formula("~0 + group + rin + cage_number + extraction_pool + pooled_status")
+
+colour_scale <- scale_color_manual(
+  name = NULL,
+  values = c(
+    "WT_DMSO" = "#b2df8a",
+    "KO_DMSO" = "#33a02c",
+    "WT_BAY" = "#a6cee3",
+    "KO_BAY" = "#1f78b4",
+    "WT_BAY_MK8722" = "#fb9a99",
+    "KO_BAY_MK8722" = "#e31a1c",
+    "WT_MK8722" = "#fdbf6f",
+    "KO_MK8722" = "#ff7f00"
+  ),
+  labels = c(
+    "WT_DMSO" = "WT DMSO",
+    "KO_DMSO" = "KO DMSO",
+    "WT_BAY" = "WT BAY",
+    "KO_BAY" = "KO BAY",
+    "WT_BAY_MK8722" = "WT BAY+MK-8722",
+    "KO_BAY_MK8722" = "KO BAY+MK-8722",
+    "WT_MK8722" = "WT MK-8722",
+    "KO_MK8722" = "KO MK-8722"
+  ),
+  breaks = c(
+    "WT_DMSO",
+    "KO_DMSO",
+    "WT_BAY",
+    "KO_BAY",
+    "WT_BAY_MK8722",
+    "KO_BAY_MK8722",
+    "WT_MK8722",
+    "KO_MK8722"
+  ),
+  limits = force,
+  drop = TRUE
+)
+```
+
+## DGE list creation for full model design
+
+```{r, message = FALSE, class.source = 'fold-show'}
+## Processing
+# DGE list creation
+dge_full_model <- edgeR::DGEList(
+  counts = counts[gene_info[["ENSEMBL"]], meta_data_sheet[["sample_id"]]],
+  samples = meta_data_sheet,
+  genes = gene_info
+  )
+
+design <-  model.matrix(object = formula_full_model,
+                        data = dge_full_model$samples)
+
+colnames(design) <- str_remove_all(colnames(design), "group")
+stopifnot(is.fullrank(design))
+
+idx_expressed <- edgeR::filterByExpr(dge_full_model, design = design)
+
+dge_full_model <- dge_full_model[idx_expressed, , keep.lib.sizes = FALSE] |>
+  edgeR::calcNormFactors() |>
+  edgeR::estimateDisp(design=design)
+```
+
+## Write CPM
+
+```{r DGE list creation for all samples, message = FALSE, class.source = 'fold-show'}
+log_cpms <- cpm(dge_full_model, log = TRUE)
+log_cpms_out <- cbind(log_cpms, dge_full_model$genes)
+log_cpms_out <- log_cpms_out[, gtools::mixedsort(colnames(log_cpms_out))] |>
+    dplyr::relocate(ENSEMBL, SYMBOL, GENENAME)
+
+
+
+
+n_groups <- length(unique(meta_data_sheet$group))
+log_cpms_corrected <- limma::removeBatchEffect(
+  x = log_cpms,
+  covariates = design[, -seq_len(n_groups)],
+  design = design[, seq_len(n_groups)])
+
+log_cpms_corrected_out <- cbind(log_cpms_corrected, dge_full_model$genes)
+log_cpms_corrected_out <- log_cpms_corrected_out[
+  ,
+  gtools::mixedsort(colnames(log_cpms_corrected_out))
+  ] |>
+    dplyr::relocate(ENSEMBL, SYMBOL, GENENAME)
+
+
+cpm_dir <- file.path(results_dir, "CPM")
+dir.create(path = cpm_dir, showWarnings = FALSE)
+
+fwrite(x = log_cpms_out,
+       file = file.path(cpm_dir, "logCPM_raw.csv.gz"))
+writexl::write_xlsx(x = log_cpms_out,
+                    path = file.path(cpm_dir, "logCPM_raw.xlsx"))
+
+fwrite(x = log_cpms_corrected_out, file =
+         file.path(cpm_dir, "logCPM_batch_corrected.csv.gz"))
+writexl::write_xlsx(x = log_cpms_corrected_out,
+                    path = file.path(cpm_dir, "logCPM_batch_corrected.xlsx"))
+```
+
+## Plotly & DT intialize
+
+```{r Plotly & DT intialize}
+htmltools::tagList(plotly:::plotly_empty())
+DT::datatable(matrix())
+```
+
+## Session info
+
+```{r Session info}
+sessionInfo()
+```
+
+# Assesment of data quality
+
+A very comprehensive and interactive QC report has been generated for all samples, and can be found in the multiqc_report.html file. We have additionally generated a number of QC stats and visualizations shown in this section.
+
+```{r Assesment of data quality}
+n_samples <- nrow(dge_full_model$samples)
+n_genes <-nrow(dge_full_model)
+n_counts_per_sample <- colSums(dge_full_model$counts)
+n_counts_total <-  sum(n_counts_per_sample)
+n_counts_per_gene_per_sample <- (n_counts_total/n_genes)/n_samples
+```
+
+From the sequencing, we obtain `r I(n_genes)` genes that are expressed in a appreciable amount across the samples to be used for our downstream analyses. With a final, filtered transcript count of `r I(round(n_counts_total/1E+06))` million across the `r I(n_samples)` samples, we have an average of `r I(round(n_counts_per_gene_per_sample))` RNA-transcripts for each gene in each sample.
+
+## MDS 2D-plot {.tabset}
+
+The figures below show the location of the samples in reduced 2-dimensional space, where similar samples are closer, and less similar samples are further apart. The similarity is based on log-fold changes in gene expression. Browse through the various tissues/cell-types, color them by your desired experimental condition, and visualize them in your preferred dimensions (each explaining less variance) by selecting the appropriate tabs below. In this way, it can be determined whether samples cluster together based on experimental condition (this suggests a strong effect of the experimental condition) or based on technical variables such as extraction batch (which is then accounted for in the analysis if possible).
+
+```{r Generate MDS plots, results="asis", warning=FALSE}
+mds_plot_variable_names <- colnames(meta_data_sheet)[c(-1,-2)] %>% set_names()
+# Move main group to the top of the list
+group_idx <- which(names(mds_plot_variable_names) == "group")
+mds_plot_variable_names <- c(mds_plot_variable_names[group_idx],
+                             mds_plot_variable_names[-group_idx])
+
+dims_list <- list(c(1,2), c(3,4), c(5,6))
+names(dims_list) <- lapply(dims_list, paste, collapse = " & ")
+
+mds_plots_for_each_variable <- list()
+mds_plots_for_each_variable_corrected <- list()
+
+for (variable in mds_plot_variable_names) {
+  for (dims_idx in names(dims_list)) {
+    mds_plots_for_each_variable[[variable]][[dims_idx]] <-
+      cbmr::ggplot_mds(y = dge_full_model,
+                       dim_plot = dims_list[[dims_idx]],
+                       colour_by = variable,
+                       labels = FALSE) %+%
+      aes(label = sample_id)
+
+
+    mds_plots_for_each_variable_corrected[[variable]][[dims_idx]] <-
+      cbmr::ggplot_mds(y = log_cpms_corrected,
+                       dim_plot = dims_list[[dims_idx]],
+                       metadata = dge_full_model[["samples"]],
+                       colour_by = variable,
+                       labels = FALSE) %+%
+      aes(label = sample_id)
+  }
+}
+
+# Add nice colour scale to the main groups
+for (i in names(mds_plots_for_each_variable[["group"]])) {
+  mds_plots_for_each_variable[["group"]][[i]] <-
+    mds_plots_for_each_variable[["group"]][[i]] +
+    colour_scale
+
+  mds_plots_for_each_variable_corrected[["group"]][[i]] <-
+    mds_plots_for_each_variable_corrected[["group"]][[i]] +
+    colour_scale
+}
+
+```
+
+```{r Plot MDS plots, results="asis", warning=FALSE}
+for (variable in mds_plot_variable_names) {
+  cbmr::catHeader_w_tabset(text = str_glue("Colored by {variable}"), level = 3)
+
+  for (dims_str in names(dims_list)) {
+    cbmr::catHeader(text = str_glue("Dimensions {dims_str}"), level = 4)
+    mds_plots_for_each_variable[[variable]][[dims_str]] %>%
+      plotly::ggplotly() |>
+      cbmr::print_plotly()
+  }
+}
+```
+
+## MDS 2D-plot corrected {.tabset}
+```{r Plot Corrected MDS plots, results="asis", warning=FALSE}
+for (variable in mds_plot_variable_names) {
+  cbmr::catHeader_w_tabset(text = str_glue("Colored by {variable}"), level = 3)
+
+  for (dims_str in names(dims_list)) {
+    cbmr::catHeader(text = str_glue("Dimensions {dims_str}"), level = 4)
+    mds_plots_for_each_variable_corrected[[variable]][[dims_str]] %>%
+      plotly::ggplotly() |>
+      cbmr::print_plotly()
+  }
+}
+```
+
+
+## MD plots
+The plot below shows the expression of each gene in each sample, compared to all the other samples, on the Y-axis. On the X-axis, genes are ranked by their average expression across the whole dataset. This plot allows for a visual assessment of the overall distribution of gene expression changes and the identification of potential outlying genes/samples.
+
+```{r, fig.width=10, fig.height=15, warning=FALSE}
+cbmr::ggplot_MD_updated(dge_full_model)
+```
+
+# Analysis Code Blocks {.tabset}
+
+## EdgeR Full model test technical variables
+
+```{r Full model test}
+fit <- edgeR::glmQLFit(
+  y = dge_full_model,
+  design = design,
+  robust = TRUE)
+
+# Update to include other continuous variables
+technical_vars <- names(attr(design, "contrasts"))[-1]
+technical_vars <- c("rin", technical_vars) |> set_names()
+
+test_technical_vars <- function(var, fit) {
+  coefs <- colnames(fit$design)[colnames(fit$design) %like% paste0("^", var)]
+  cbmr::edgeR_tester(coef = coefs,
+                     efit = fit,
+                     id_name = "ENSEMBL")
+}
+
+deg_technical_vars <- map(technical_vars, test_technical_vars, fit = fit)
+```
+
+
+## EdgeR final model fit
+```{r EdgeR final model}
+contrast_matrix <- limma::makeContrasts(
+  levels = design,
+
+  #treatment effects
+  wt_dmso_mk_vs_wt_dmso = WT_MK8722 - WT_DMSO, #1
+  wt_bay_vs_wt_dmso = WT_BAY - WT_DMSO, #2
+  wt_bay_mk_vs_wt_dmso = WT_BAY_MK8722 - WT_DMSO, #3
+  wt_bay_vs_wt_mk = WT_BAY - WT_MK8722, #13
+  wt_bay_mk_vs_wt_bay =  WT_BAY_MK8722 - WT_BAY, #15
+
+  #.. and similarly for KO:
+  ko_dmso_mk_vs_ko_dmso = KO_MK8722 - KO_DMSO, #4
+  ko_bay_vs_ko_dmso = KO_BAY - KO_DMSO, #5
+  ko_bay_mk_vs_ko_dmso = KO_BAY_MK8722 - KO_DMSO, #6
+  ko_bay_vs_ko_mk = KO_BAY - KO_MK8722, #14
+  ko_bay_mk_vs_ko_bay =  KO_BAY_MK8722 - KO_BAY, #16
+
+  #not done
+  #wt_bay_mk_vs_wt_mk = WT_BAY_MK8722 - WT_MK8722,
+  #ko_bay_mk_vs_ko_mk = KO_BAY_MK8722 - KO_MK8722,
+
+  #Cell type effects of bay?
+  ko_bay_vs_wt_bay = KO_BAY - WT_BAY, #7
+  #do controls work as expected? - effect of mk + dmso (dmso implicit part of mk treatment):
+  ko_mk_vs_wt_mk = KO_MK8722 - WT_MK8722, #8
+  #- effect of dmso
+  ko_dmso_vs_wt_dmso = KO_DMSO - WT_DMSO, #9
+  #Some change-cell_type-change-treatment cases:
+  ko_dmso_vs_wt_bay = KO_DMSO - WT_BAY, #10
+  ko_bay_vs_wt_bay_mk = KO_BAY - WT_BAY_MK8722, #11
+  ko_mk_vs_wt_bay_mk = KO_MK8722 - WT_BAY_MK8722 #12
+)
+
+contrast_names <- colnames(contrast_matrix) |> set_names()
+
+deg_contrasts <- map(
+  contrast_names,
+  cbmr::edgeR_tester,
+  contrast_matrix = contrast_matrix,
+  efit = fit,
+  id_name = "ENSEMBL")
+invisible(lapply(deg_contrasts, `[`, , c("ENSEMBL", "F") := NULL))
+deg_contrasts <- map(deg_contrasts, rename, avg_log2_CPM_project_wide=logCPM)
+```
+
+## GO
+```{r GO, message=FALSE, class.source = 'fold-show'}
+terms <-
+  cbmr::get_enrichment_terms(
+    org_db = org_db,
+    gene_ids = rownames(fit),
+    gene_id_key_type = "ENSEMBL",
+    min_genes = 5,
+    max_genes = 500,
+    cache_path = "shared_data/GO_terms_cache")
+
+ontology_tests <- map(
+  terms,
+  run_ontology_tests,
+  y = dge_full_model,
+  contrast_matrix = contrast_matrix,
+  fun = limma::camera) |>
+  suppressWarnings()
+
+```
+
+## Write tables {.tabset}
+
+### DE
+
+```{r Write DE tables}
+writexl::write_xlsx(deg_contrasts, str_glue("{results_dir}/differential_gene_expression.xlsx"))
+de_results_dir <- file.path(results_dir, "differential_gene_expression")
+dir.create(path = de_results_dir, showWarnings = FALSE)
+
+for (i in names(deg_contrasts)) {
+  fwrite(x = deg_contrasts[[i]],
+         file = str_glue("{results_dir}/differential_gene_expression/DEG_{i}.csv.gz"))
+}
+
+```
+
+### GO
+
+```{r Write GO tables}
+# Gene ontology results with list of relevant genes
+go_results_dir <- file.path(results_dir, "gene_ontology_enrichment_comparisons")
+dir.create(path = go_results_dir, showWarnings = FALSE)
+
+writexl::write_xlsx(ontology_tests[["BP"]],
+                    str_glue("{results_dir}/Biological_Process.xlsx"))
+writexl::write_xlsx(ontology_tests[["CC"]],
+                    str_glue("{results_dir}/Cellular_Compartment.xlsx"))
+writexl::write_xlsx(ontology_tests[["MF"]],
+                    str_glue("{results_dir}/Molecular_Function.xlsx"))
+writexl::write_xlsx(ontology_tests[["Reactome"]],
+                    str_glue("{results_dir}/Reactome.xlsx"))
+
+go_results_dir <- file.path(results_dir, "gene_ontology_enrichment_comparisons")
+dir.create(path = go_results_dir, showWarnings = FALSE)
+
+for (j in names(ontology_tests)) {
+  this_term_folder <- file.path(go_results_dir, j)
+  dir.create(path = this_term_folder, showWarnings = FALSE)
+  for (i in names(deg_contrasts)) {
+    fwrite(x = deg_contrasts[[i]],
+           file = str_glue("{this_term_folder}/GO_{i}.csv.gz"))
+  }
+}
+```
+
+
+## Save R-files
+
+```{r Save R-files}
+dir.create(file.path(results_dir,"R_data_files"), showWarnings = F)
+saveRDS(dge_full_model, file.path(results_dir,"R_data_files/DGE.RDS"))
+saveRDS(fit, file.path(results_dir,"R_data_files/fit.RDS"))
+```
+
+
+
+# Results summary
+
+The analysis consists of two major parts:
+
+1)  A differential gene expression analysis where the expression of each gene is compared between two experimental groups in a single tissue, e.g. Group A vs Group B. In the case of more complicated experimental setups, more than two groups can also be compared simultaneously to determine interacting effects between two experimental variables, such as the interaction between treatment and cell-type/tissue. This situation will typically be labelled as: "Treatment A vs Treatment B in Tissue A vs Tissue B". If treatment B is a vehicle/reference treatment, the intuitive interpretation is thus: "What effect on gene expression does Treatment A have in Tissue A, compared to its effect in Tissue B". An equivalent, but often less useful, interpretation is: "What effect on gene expression does Tissue A have during Treatment A, compared to during Treatment B. Many significant genes here suggest a synergistic, or non-additive, effect of the two experimental variables, while no genes suggest no such interaction effects.
+
+2)  A gene ontology (GO) analysis, where GO-terms (i.e.biological processes) are tested to see whether their associated genes tend to be either up-regulated and down-regulated in the comparison as described above. A significant result here suggests that this biological process could be influenced by the experimental condition. Specifically, the Camera test is used: <https://doi.org/10.1093%2Fnar%2Fgks461>.
+
+The summarized results, i.e. number of significant genes and GO-terms for each comparison, are shown in the table below:
+
+```{r Calculate and print summary table for simple setup, warning=FALSE}
+merged_ontologies <- list()
+for (i in names(ontology_tests)) {
+  for (j in names(ontology_tests[[i]])) {
+    this_table <- ontology_tests[[i]][[j]]
+    this_table[["Ontology"]] <- i
+    merged_ontologies[[j]] <- rbind(merged_ontologies[[j]], this_table)
+  }
+}
+
+summary_table <- list(
+  "Differentially expressed genes (FDR<5%)" = cbmr::n_sig_genes_pr_contrast(deg_contrasts),
+  "Enriched GO-terms (FDR<5%)" = cbmr::n_sig_genes_pr_contrast(merged_ontologies)
+  ) |>
+  bind_cols() |>
+  mutate(`Comparisons`=colnames(contrast_matrix)) |>
+  relocate(`Comparisons`)
+
+summary_table |>
+  knitr::kable()
+```
+
+# Detailed results
+In the following sections, the specific results for all comparisons (i.e. both simple and complex/interacting) are shown. This includes:
+
+1)  A table of all significant genes (using adjusted P-values, i.e. false-discovery rate (FDR \< 0.05)), ordered by P-value and FDR. In the simple "Group A vs Group B"-comparison, a gene will have a positive log 2 fold-change (logFC) if it is up-regulated in Group A compared to Group B. Conversely, it will have a negative logFC if it is down-regulated in Group A compared to Group B. \
+\
+In the more complex "Treatment A vs Treatment B in Tissue A vs Tissue B"-comparisons, a positive logFC means that expression of the gene is more increased as a result of Treatment A in Tissue A, compared to the treatment in Tissue B. Note however, that Treatment A might still result in reduced expression of the gene in both tissues - it is merely a positive effect when compared to the the effect in the other tissue. \
+\
+In these tables, you can use the box to search for a specific gene. Importantly, tables with all tested genes (significant or not), are found in the results directory in the form of both excel and tab-seperated value (tsv) files.
+
+2)  A volcano plot of all nominally significant genes. A red color indicates the truly significant genes, i.e. FDR\<0.05.
+
+3)  Distribution of the P-values for each gene tested. An enrichment of low P-values suggest a difference in gene expression due to the tested experimental condition, while a uniform distribution suggest no effect. Sometimes, an enrichment of low P-values can be observed even though no single gene has an FDR\<0.05
+
+4)  A table of all significant GO-terms (i.e. FDR \< 0.05), ordered by P-value and FDR. In such a Group A vs Group B comparison, a GO-term will have the direction "Up" if the associated genes tend to be up-regulated in Group A compared to Group B. Conversely, it will have the direction "Down" if the associated genes tend to be down-regulated in Group A compared to Group B. Like in the gene case, you can use the box to search for a specific GO-term of your choice. Similarly, the full tables with all tested GO-terms (significant or not), are found in the results directory in the form of both excel and tab-seperated value (tsv) files.
+```{r}
+# TO DO fix "Name" and "ENSEMBL_ID"
+deg_contrasts <- lapply(deg_contrasts, dplyr::rename,
+                        Name = SYMBOL,
+                        ENSEMBL_ID = ENSEMBL,
+                        description = GENENAME)
+
+get_GO_datatable_updated <- function(df, ...) {
+  df %>%
+    transmute(ID,
+              Direction=as.factor(Direction),
+              Ontology,
+              TERM,
+              `#genes`=NGenes,
+              PValue=signif(PValue,2),
+              FDR=signif(FDR, 2)) %>%
+    DT::datatable(#extensions = 'Buttons',
+      # filter="top",
+      rownames = FALSE,
+      options = list(dom = 'Bfrtip',
+                     buttons = c('copy', 'csv', 'excel', 'colvis'),
+                     pageLength = 10),
+      height = 700,
+      width = "100%",
+      ...)
+}
+
+```
+
+
+```{r Print detailed results, results="asis",warning=FALSE}
+for (contrast in contrast_names) {
+  cbmr::catHeader_w_tabset(text = contrast, level = 2)
+
+  cbmr::catHeader("Gene table (FDR<0.05)", level = 3)
+  deg_contrasts[[contrast]] |>
+    dplyr::filter(FDR<0.05) |>
+    dplyr::slice_head(n = 100) |>
+    cbmr::get_DE_datatable_updated() |>
+    cbmr::print_DT()
+
+  cbmr::catHeader("Volcano plot (unadj.P-val<0.05)", level = 3)
+  deg_contrasts[[contrast]] |>
+    cbmr::ggplot_volcano_updated() |>
+    cbmr::print_plotly()
+
+  cbmr::catHeader("P-value distribution", level=3)
+  deg_contrasts[[contrast]] |>
+    pull("PValue") |>
+    hist(main="P-value distribution of all genes tested") |>
+    invisible()
+
+  cbmr::catHeader("GO-term table (FDR<0.05)", level=3)
+  merged_ontologies[[contrast]] |>
+    filter(FDR<0.05) |>
+    arrange(PValue) |>
+    dplyr::slice_head(n = 100) |>
+    get_GO_datatable_updated() |>
+    cbmr::print_DT()
+}
+```
+
+
+
+# Model specification
+
+## P-value distributions for extra variables in the full model {.tabset}
+
+We first test if including additional technical variables improves the model fit. The P-values are expected to be enriched for low values if the effect is significant for a number of genes and uniformly distributed or skewed towards 1 if genes tend not to be affected by the extra variables.
+
+```{r Plot technical vars histograms, results="asis"}
+for (i in names(deg_technical_vars)) {
+  cbmr::catHeader(text=i , level = 3)
+  hist(deg_technical_vars[[i]][["PValue"]],
+       main = str_glue("P-value distribution of {i} effect"))
+}
+```
